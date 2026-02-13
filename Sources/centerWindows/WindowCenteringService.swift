@@ -5,6 +5,7 @@ enum WindowCenteringError: LocalizedError {
     case accessibilityPermissionMissing
     case noFrontmostApplication
     case noWindow
+    case fullscreenWindow
     case unableToReadWindowFrame
     case unableToWriteWindowPosition
 
@@ -16,6 +17,8 @@ enum WindowCenteringError: LocalizedError {
             return "未检测到前台应用。"
         case .noWindow:
             return "前台应用没有可操作窗口。"
+        case .fullscreenWindow:
+            return "当前窗口处于全屏状态，已跳过居中。"
         case .unableToReadWindowFrame:
             return "无法读取窗口位置或尺寸。"
         case .unableToWriteWindowPosition:
@@ -24,13 +27,18 @@ enum WindowCenteringError: LocalizedError {
     }
 }
 
+enum WindowSelectionPolicy {
+    case focusedOnly
+    case focusedOrAnyNonFullscreen
+}
+
 final class WindowCenteringService {
     private enum CoordinateMode {
         case bottomLeft
         case topLeft(screenTop: CGFloat)
     }
 
-    func centerFrontmostWindow() throws {
+    func centerFrontmostWindow(selectionPolicy: WindowSelectionPolicy = .focusedOrAnyNonFullscreen) throws {
         guard AccessibilityPermission.ensureTrusted(prompt: false) else {
             throw WindowCenteringError.accessibilityPermissionMissing
         }
@@ -40,7 +48,19 @@ final class WindowCenteringService {
         }
 
         let appElement = AXUIElementCreateApplication(app.processIdentifier)
-        guard let windowElement = focusedWindowElement(for: appElement) else {
+        let focusedWindow = focusedWindowElement(for: appElement)
+        let allWindows = windowElements(for: appElement)
+        guard let windowElement = selectCenterableWindow(
+            focused: focusedWindow,
+            windows: allWindows,
+            selectionPolicy: selectionPolicy
+        ) else {
+            if let focusedWindow, boolAttribute("AXFullScreen" as CFString, on: focusedWindow) == true {
+                throw WindowCenteringError.fullscreenWindow
+            }
+            if allWindows.contains(where: { boolAttribute("AXFullScreen" as CFString, on: $0) == true }) {
+                throw WindowCenteringError.fullscreenWindow
+            }
             throw WindowCenteringError.noWindow
         }
 
@@ -68,17 +88,30 @@ final class WindowCenteringService {
     }
 
     private func focusedWindowElement(for appElement: AXUIElement) -> AXUIElement? {
-        if let focused = windowAttribute(kAXFocusedWindowAttribute as CFString, on: appElement) {
-            return focused
-        }
+        windowAttribute(kAXFocusedWindowAttribute as CFString, on: appElement)
+    }
 
+    private func windowElements(for appElement: AXUIElement) -> [AXUIElement] {
         var value: CFTypeRef?
         let result = AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &value)
         guard result == .success else {
+            return []
+        }
+        return (value as? [AXUIElement]) ?? []
+    }
+
+    private func selectCenterableWindow(
+        focused: AXUIElement?,
+        windows: [AXUIElement],
+        selectionPolicy: WindowSelectionPolicy
+    ) -> AXUIElement? {
+        if let focused, boolAttribute("AXFullScreen" as CFString, on: focused) != true {
+            return focused
+        }
+        if selectionPolicy == .focusedOnly {
             return nil
         }
-
-        return (value as? [AXUIElement])?.first
+        return windows.first(where: { boolAttribute("AXFullScreen" as CFString, on: $0) != true })
     }
 
     private func windowAttribute(_ attribute: CFString, on element: AXUIElement) -> AXUIElement? {
@@ -139,6 +172,17 @@ final class WindowCenteringService {
             return false
         }
         return AXUIElementSetAttributeValue(element, attribute, axValue) == .success
+    }
+
+    private func boolAttribute(_ attribute: CFString, on element: AXUIElement) -> Bool? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, attribute, &value) == .success else {
+            return nil
+        }
+        guard let value, CFGetTypeID(value) == CFBooleanGetTypeID() else {
+            return nil
+        }
+        return CFBooleanGetValue(unsafeDowncast(value, to: CFBoolean.self))
     }
 
     private func detectWindowContext(rawPosition: CGPoint, windowSize: CGSize) -> (screen: NSScreen, mode: CoordinateMode)? {
