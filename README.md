@@ -52,20 +52,7 @@ export NOTARY_PROFILE="AC_NOTARY"
 scripts/sign_and_notarize.sh
 ```
 
-推荐发布流程（用于 GitHub Release 上传）：
-
-```bash
-export DEVELOPER_ID_APP="Developer ID Application: YOUR_NAME (TEAMID)"
-export NOTARY_PROFILE="AC_NOTARY"
-scripts/release_build.sh
-```
-
-说明：未签名/未公证的 DMG 在新设备上可能被 Gatekeeper 判定为“已损坏，无法打开”。
-
-## 免费分发（不走付费签名/公证）
-
-如果你选择免费分发（不使用 Developer ID），请在 Release 说明中明确告知用户：
-
+## 安装说明
 1. 打开 DMG，将 `centerWindows.app` 拖到 `Applications`。
 2. 到 `Applications` 中右键 `centerWindows.app` -> `打开` -> 再次点击 `打开`。
 3. 若仍被拦截：`系统设置 -> 隐私与安全性` 页面底部点击“仍要打开”。
