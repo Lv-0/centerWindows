@@ -37,6 +37,13 @@ Outputs:
 - `dist/centerWindows.app`
 - `dist/centerWindows.dmg`
 
+The DMG includes:
+
+- `centerWindows.app`
+- `Applications` (shortcut to system Applications folder)
+
+Install by dragging `centerWindows.app` into `Applications`.
+
 ## Sign and notarize (Developer ID)
 
 ```bash
@@ -44,6 +51,31 @@ export DEVELOPER_ID_APP="Developer ID Application: YOUR_NAME (TEAMID)"
 export NOTARY_PROFILE="AC_NOTARY"
 scripts/sign_and_notarize.sh
 ```
+
+Recommended release flow (for GitHub Releases assets):
+
+```bash
+export DEVELOPER_ID_APP="Developer ID Application: YOUR_NAME (TEAMID)"
+export NOTARY_PROFILE="AC_NOTARY"
+scripts/release_build.sh
+```
+
+Note: Unsigned/unnotarized DMG files can be blocked on a new Mac and may show as “damaged”.
+
+## Free distribution (without paid signing/notarization)
+
+If you distribute without Developer ID notarization, include these steps in release notes:
+
+1. Open the DMG and drag `centerWindows.app` into `Applications`.
+2. In `Applications`, right-click `centerWindows.app` -> `Open` -> click `Open` again.
+3. If blocked, go to `System Settings -> Privacy & Security` and click “Open Anyway”.
+4. If still blocked, run:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/centerWindows.app
+```
+
+This is a normal Gatekeeper flow for unnotarized apps, not a corruption of app code.
 
 ## Permissions
 

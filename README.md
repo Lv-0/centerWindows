@@ -37,6 +37,13 @@ scripts/create_dmg.sh
 - `dist/centerWindows.app`
 - `dist/centerWindows.dmg`
 
+DMG 打开后会包含两个项目：
+
+- `centerWindows.app`
+- `Applications`（系统应用目录快捷方式）
+
+安装方式：将 `centerWindows.app` 拖到 `Applications`。
+
 ## 签名与公证（Developer ID）
 
 ```bash
@@ -44,6 +51,31 @@ export DEVELOPER_ID_APP="Developer ID Application: YOUR_NAME (TEAMID)"
 export NOTARY_PROFILE="AC_NOTARY"
 scripts/sign_and_notarize.sh
 ```
+
+推荐发布流程（用于 GitHub Release 上传）：
+
+```bash
+export DEVELOPER_ID_APP="Developer ID Application: YOUR_NAME (TEAMID)"
+export NOTARY_PROFILE="AC_NOTARY"
+scripts/release_build.sh
+```
+
+说明：未签名/未公证的 DMG 在新设备上可能被 Gatekeeper 判定为“已损坏，无法打开”。
+
+## 免费分发（不走付费签名/公证）
+
+如果你选择免费分发（不使用 Developer ID），请在 Release 说明中明确告知用户：
+
+1. 打开 DMG，将 `centerWindows.app` 拖到 `Applications`。
+2. 到 `Applications` 中右键 `centerWindows.app` -> `打开` -> 再次点击 `打开`。
+3. 若仍被拦截：`系统设置 -> 隐私与安全性` 页面底部点击“仍要打开”。
+4. 若仍失败，可在终端执行：
+
+```bash
+xattr -dr com.apple.quarantine /Applications/centerWindows.app
+```
+
+注意：这是非公证分发的常见安装流程，不是应用自身代码损坏。
 
 ## 权限
 
