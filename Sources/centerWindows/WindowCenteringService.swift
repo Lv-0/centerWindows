@@ -105,7 +105,15 @@ final class WindowCenteringService {
             throw WindowCenteringError.unableToReadWindowFrame
         }
 
-        guard let context = detectWindowContext(rawPosition: currentPosition, windowSize: windowSize, pid: pid) else {
+        let primaryTopY = primaryScreenTopY()
+        let context: WindowContext?
+        if let pid, let cgContext = detectWindowContextUsingCG(windowElement: windowElement, pid: pid, rawPosition: currentPosition, windowSize: windowSize, primaryTopY: primaryTopY) {
+            context = cgContext
+        } else {
+            context = detectWindowContext(rawPosition: currentPosition, windowSize: windowSize, pid: pid, primaryTopY: primaryTopY)
+        }
+
+        guard let context else {
             throw WindowCenteringError.unableToReadWindowFrame
         }
 
@@ -115,7 +123,8 @@ final class WindowCenteringService {
             bottomLeftOrigin: centeredBottomLeftOrigin,
             windowSize: windowSize,
             screenFrame: context.screen.frame,
-            space: context.space
+            space: context.space,
+            primaryTopY: primaryTopY
         )
 
         if setPointAttribute(kAXPositionAttribute as CFString, value: targetAXOrigin, on: windowElement) {
@@ -129,7 +138,8 @@ final class WindowCenteringService {
             bottomLeftOrigin: backInVisible,
             windowSize: windowSize,
             screenFrame: context.screen.frame,
-            space: context.space
+            space: context.space,
+            primaryTopY: primaryTopY
         )
         _ = setPointAttribute(kAXPositionAttribute as CFString, value: backAXOrigin, on: windowElement)
 
@@ -282,11 +292,12 @@ final class WindowCenteringService {
             return false
         }
 
+        let primaryTopY = primaryScreenTopY()
         for screen in NSScreen.screens {
             let screenFrame = screen.frame
 
             for space in [RawSpace.globalBottomLeft, .globalTopLeft, .localBottomLeft, .localTopLeft] {
-                let rect = rawToGlobalRect(space: space, screenFrame: screenFrame, rawPosition: rawPosition, windowSize: windowSize)
+                let rect = rawToGlobalRect(space: space, screenFrame: screenFrame, rawPosition: rawPosition, windowSize: windowSize, primaryTopY: primaryTopY)
                 if isFullscreenLike(windowFrame: rect, screenFrame: screenFrame) {
                     return true
                 }
@@ -314,7 +325,7 @@ final class WindowCenteringService {
         return posMatch && ratio >= 0.98
     }
 
-    private func detectWindowContext(rawPosition: CGPoint, windowSize: CGSize, pid: pid_t?) -> WindowContext? {
+    private func detectWindowContext(rawPosition: CGPoint, windowSize: CGSize, pid: pid_t?, primaryTopY: CGFloat) -> WindowContext? {
         let screens = NSScreen.screens
         guard !screens.isEmpty else { return nil }
 
@@ -333,7 +344,7 @@ final class WindowCenteringService {
             let screenFrame = screen.frame
 
             for space in [RawSpace.globalBottomLeft, .globalTopLeft, .localBottomLeft, .localTopLeft] {
-                let globalRect = rawToGlobalRect(space: space, screenFrame: screenFrame, rawPosition: rawPosition, windowSize: windowSize)
+                let globalRect = rawToGlobalRect(space: space, screenFrame: screenFrame, rawPosition: rawPosition, windowSize: windowSize, primaryTopY: primaryTopY)
                 let overlap = globalRect.intersection(screenFrame).area
                 let dist2 = distanceSquaredFromRectCenter(globalRect, to: screenFrame)
                 consider(
@@ -354,12 +365,129 @@ final class WindowCenteringService {
                 cachedSpaceByPID[pid] = best.space
             } else if cachedScreen != nil, let cachedScreen, let cachedSpace {
                 let screenFrame = cachedScreen.frame
-                let globalRect = rawToGlobalRect(space: cachedSpace, screenFrame: screenFrame, rawPosition: rawPosition, windowSize: windowSize)
+                let globalRect = rawToGlobalRect(space: cachedSpace, screenFrame: screenFrame, rawPosition: rawPosition, windowSize: windowSize, primaryTopY: primaryTopY)
                 return WindowContext(screen: cachedScreen, space: cachedSpace, overlap: 0, currentGlobalRect: globalRect)
             }
             return WindowContext(screen: best.screen, space: best.space, overlap: best.overlap, currentGlobalRect: best.globalRect)
         }
         return nil
+    }
+
+    private func detectWindowContextUsingCG(
+        windowElement: AXUIElement,
+        pid: pid_t,
+        rawPosition: CGPoint,
+        windowSize: CGSize,
+        primaryTopY: CGFloat
+    ) -> WindowContext? {
+        guard
+            ScreenCapturePermission.ensureAuthorized(prompt: false),
+            let windowID = windowIDAttribute(on: windowElement),
+            let cgRect = cgWindowBounds(windowID: windowID, pid: pid),
+            let screenPick = pickScreenForCGRect(cgRect)
+        else {
+            return nil
+        }
+
+        let screen = screenPick.screen
+        let screenFrame = screen.frame
+
+        // Convert CG global rect (origin at top-left of primary, y grows down) to Cocoa global rect.
+        let cocoaRect = cocoaRectFromCGWindowBounds(cgRect, screen: screen, primaryTopY: primaryTopY)
+
+        var best: (space: RawSpace, globalRect: CGRect, error: CGFloat)?
+        for space in [RawSpace.globalBottomLeft, .globalTopLeft, .localBottomLeft, .localTopLeft] {
+            let globalRect = rawToGlobalRect(space: space, screenFrame: screenFrame, rawPosition: rawPosition, windowSize: windowSize, primaryTopY: primaryTopY)
+            let err = rectMatchError(globalRect, cocoaRect)
+            if let best, best.error <= err { continue }
+            best = (space, globalRect, err)
+        }
+        guard let best else { return nil }
+
+        if let id = displayID(for: screen) {
+            cachedDisplayByPID[pid] = id
+        }
+        cachedSpaceByPID[pid] = best.space
+
+        return WindowContext(screen: screen, space: best.space, overlap: screenPick.area, currentGlobalRect: best.globalRect)
+    }
+
+    private func rectMatchError(_ a: CGRect, _ b: CGRect) -> CGFloat {
+        abs(a.minX - b.minX) +
+            abs(a.minY - b.minY) +
+            abs(a.width - b.width) +
+            abs(a.height - b.height)
+    }
+
+    private func windowIDAttribute(on window: AXUIElement) -> CGWindowID? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(window, "AXWindowNumber" as CFString, &value) == .success else {
+            return nil
+        }
+        guard let value, CFGetTypeID(value) == CFNumberGetTypeID() else {
+            return nil
+        }
+        var n: Int32 = 0
+        guard CFNumberGetValue(unsafeDowncast(value, to: CFNumber.self), .sInt32Type, &n) else {
+            return nil
+        }
+        if n <= 0 { return nil }
+        return CGWindowID(n)
+    }
+
+    private func cgWindowBounds(windowID: CGWindowID, pid: pid_t) -> CGRect? {
+        let options: CGWindowListOption = [.optionIncludingWindow]
+        guard let list = CGWindowListCopyWindowInfo(options, windowID) as? [[String: Any]] else {
+            return nil
+        }
+        guard let info = list.first else { return nil }
+        if let ownerPID = info[kCGWindowOwnerPID as String] as? Int, ownerPID != Int(pid) {
+            return nil
+        }
+        guard let boundsDict = info[kCGWindowBounds as String] as? NSDictionary else { return nil }
+        return CGRect(dictionaryRepresentation: boundsDict)
+    }
+
+    private func pickScreenForCGRect(_ cgRect: CGRect) -> (screen: NSScreen, area: CGFloat)? {
+        let screens = NSScreen.screens
+        guard !screens.isEmpty else { return nil }
+
+        var best: (screen: NSScreen, area: CGFloat)?
+        var candidates: [NSScreen] = []
+
+        for screen in screens {
+            guard let id = displayID(for: screen) else { continue }
+            let cgDisplay = CGDisplayBounds(id)
+            let area = cgRect.intersection(cgDisplay).area
+            if let best, abs(area - best.area) <= 0.5 {
+                candidates.append(screen)
+            } else if best == nil || area > best!.area + 0.5 {
+                best = (screen, area)
+                candidates = [screen]
+            }
+        }
+        guard let best else { return nil }
+        if candidates.count == 1 {
+            return best
+        }
+        let center = CGPoint(x: cgRect.midX, y: cgRect.midY)
+        let chosen = candidates.first(where: {
+            guard let id = displayID(for: $0) else { return false }
+            return CGDisplayBounds(id).contains(center)
+        }) ?? best.screen
+        return (chosen, best.area)
+    }
+
+    private func cocoaRectFromCGWindowBounds(_ cgRect: CGRect, screen: NSScreen, primaryTopY: CGFloat) -> CGRect {
+        guard let id = displayID(for: screen) else {
+            let y = primaryTopY - cgRect.minY - cgRect.height
+            return CGRect(x: cgRect.minX, y: y, width: cgRect.width, height: cgRect.height)
+        }
+        let cgDisplay = CGDisplayBounds(id)
+        let screenFrame = screen.frame
+        let cocoaX = screenFrame.minX + (cgRect.minX - cgDisplay.minX)
+        let cocoaY = primaryTopY - cgRect.minY - cgRect.height
+        return CGRect(x: cocoaX, y: cocoaY, width: cgRect.width, height: cgRect.height)
     }
 
     private func consider(candidate: ContextCandidate, best: inout ContextCandidate?, cachedScreen: NSScreen?, cachedSpace: RawSpace?) {
@@ -414,12 +542,12 @@ final class WindowCenteringService {
         best = candidate
     }
 
-    private func toAXOrigin(bottomLeftOrigin: CGPoint, windowSize: CGSize, screenFrame: CGRect, space: RawSpace) -> CGPoint {
+    private func toAXOrigin(bottomLeftOrigin: CGPoint, windowSize: CGSize, screenFrame: CGRect, space: RawSpace, primaryTopY: CGFloat) -> CGPoint {
         switch space {
         case .globalBottomLeft:
             return CGPoint(x: bottomLeftOrigin.x.rounded(), y: bottomLeftOrigin.y.rounded())
         case .globalTopLeft:
-            let y = (screenFrame.maxY - bottomLeftOrigin.y - windowSize.height).rounded()
+            let y = (primaryTopY - bottomLeftOrigin.y - windowSize.height).rounded()
             return CGPoint(x: bottomLeftOrigin.x.rounded(), y: y)
         case .localBottomLeft:
             let x = (bottomLeftOrigin.x - screenFrame.minX).rounded()
@@ -432,12 +560,12 @@ final class WindowCenteringService {
         }
     }
 
-    private func rawToGlobalRect(space: RawSpace, screenFrame: CGRect, rawPosition: CGPoint, windowSize: CGSize) -> CGRect {
+    private func rawToGlobalRect(space: RawSpace, screenFrame: CGRect, rawPosition: CGPoint, windowSize: CGSize, primaryTopY: CGFloat) -> CGRect {
         switch space {
         case .globalBottomLeft:
             return CGRect(origin: rawPosition, size: windowSize)
         case .globalTopLeft:
-            let convertedBottomY = screenFrame.maxY - rawPosition.y - windowSize.height
+            let convertedBottomY = primaryTopY - rawPosition.y - windowSize.height
             return CGRect(x: rawPosition.x, y: convertedBottomY, width: windowSize.width, height: windowSize.height)
         case .localBottomLeft:
             return CGRect(
@@ -504,6 +632,13 @@ final class WindowCenteringService {
 
     private func displayID(for screen: NSScreen) -> CGDirectDisplayID? {
         screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID
+    }
+
+    private func primaryScreenTopY() -> CGFloat {
+        // Primary display's top edge in Cocoa global coordinates (also equals its height when minY == 0).
+        let screens = NSScreen.screens
+        let primary = screens.first(where: { abs($0.frame.minX) < 0.5 && abs($0.frame.minY) < 0.5 })
+        return (primary ?? NSScreen.main ?? screens.first)?.frame.maxY ?? 0
     }
 }
 
