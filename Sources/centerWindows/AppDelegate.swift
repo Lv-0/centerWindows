@@ -5,23 +5,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let centeringService = WindowCenteringService()
     private lazy var eventObserver = WindowEventObserver(service: centeringService)
     private var statusItem: NSStatusItem?
+    private var launchCenterTimer: DispatchSourceTimer?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupStatusItem()
         _ = ScreenCapturePermission.ensureAuthorized(prompt: true)
         _ = AccessibilityPermission.ensureTrusted(prompt: true)
-        centerOnceOnLaunch()
         eventObserver.start()
+        centerOnceOnLaunch()
     }
 
     @objc private func centerNow() {
+        centerNowInternal(showAlertOnFailure: true, selectionPolicy: .focusedOnly)
+    }
+
+    private func centerNowInternal(showAlertOnFailure: Bool, selectionPolicy: WindowSelectionPolicy) {
         do {
-            try centeringService.centerFrontmostWindow(selectionPolicy: .focusedOnly)
+            try centeringService.centerFrontmostWindow(selectionPolicy: selectionPolicy)
         } catch {
             if let centeringError = error as? WindowCenteringError, centeringError == .fullscreenWindow {
                 return
             }
-            showAlert(title: "窗口居中失败", message: error.localizedDescription)
+            if showAlertOnFailure {
+                showAlert(title: "窗口居中失败", message: error.localizedDescription)
+            }
         }
     }
 
@@ -88,9 +95,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func centerOnceOnLaunch() {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
-            self?.centerNow()
+        // On launch, focus/permission prompts can delay when the "real" frontmost window is stable.
+        // Retry for a short period without showing alerts.
+        launchCenterTimer?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        var attempts = 0
+        timer.schedule(deadline: .now() + 0.35, repeating: 0.45)
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            attempts += 1
+            self.centerNowInternal(showAlertOnFailure: false, selectionPolicy: .focusedOrAnyNonFullscreen)
+
+            // Stop after a few seconds to avoid any "continuous" behavior.
+            if attempts >= 10 {
+                self.launchCenterTimer?.cancel()
+                self.launchCenterTimer = nil
+            }
         }
+        launchCenterTimer = timer
+        timer.resume()
     }
 
     private func showAlert(title: String, message: String) {

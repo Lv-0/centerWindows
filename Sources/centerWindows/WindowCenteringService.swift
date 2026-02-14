@@ -33,10 +33,29 @@ enum WindowSelectionPolicy {
 }
 
 final class WindowCenteringService {
-    private enum CoordinateMode {
+    private enum CoordinateKind {
         case bottomLeft
-        case topLeft(screenTop: CGFloat)
+        case topLeft
     }
+
+    private struct WindowContext {
+        let screen: NSScreen
+        let kind: CoordinateKind
+        let overlap: CGFloat
+    }
+
+    private struct ContextCandidate {
+        let screen: NSScreen
+        let kind: CoordinateKind
+        let rect: CGRect
+        let overlap: CGFloat
+        let distance2: CGFloat
+    }
+
+    // When a window is mostly off-screen, overlap-based inference becomes ambiguous.
+    // Cache the last reliable coordinate system per PID to keep behavior stable.
+    private var cachedKindByPID: [pid_t: CoordinateKind] = [:]
+    private var cachedDisplayByPID: [pid_t: CGDirectDisplayID] = [:]
 
     func centerFrontmostWindow(selectionPolicy: WindowSelectionPolicy = .focusedOrAnyNonFullscreen) throws {
         guard AccessibilityPermission.ensureTrusted(prompt: false) else {
@@ -65,10 +84,10 @@ final class WindowCenteringService {
             throw WindowCenteringError.noWindow
         }
 
-        try centerWindowElement(windowElement)
+        try centerWindowElement(windowElement, pid: app.processIdentifier)
     }
 
-    func centerWindowElement(_ windowElement: AXUIElement, appElement: AXUIElement? = nil) throws {
+    func centerWindowElement(_ windowElement: AXUIElement, pid: pid_t? = nil, appElement: AXUIElement? = nil) throws {
         if let appElement, isApplicationInFullscreen(appElement) {
             throw WindowCenteringError.fullscreenWindow
         }
@@ -83,20 +102,55 @@ final class WindowCenteringService {
             throw WindowCenteringError.unableToReadWindowFrame
         }
 
-        guard let context = detectWindowContext(rawPosition: currentPosition, windowSize: windowSize) else {
+        guard let context = detectWindowContext(rawPosition: currentPosition, windowSize: windowSize, pid: pid) else {
             throw WindowCenteringError.unableToReadWindowFrame
         }
 
         let visibleFrame = effectiveVisibleFrame(for: context.screen)
         let centeredBottomLeftOrigin = WindowGeometry.centeredOrigin(windowSize: windowSize, visibleFrame: visibleFrame)
-        let targetAXOrigin = CGPoint(
-            x: centeredBottomLeftOrigin.x,
-            y: toAXY(bottomLeftY: centeredBottomLeftOrigin.y, windowHeight: windowSize.height, mode: context.mode)
+        let targetAXOrigin = toAXOrigin(
+            bottomLeftOrigin: centeredBottomLeftOrigin,
+            windowSize: windowSize,
+            screenFrame: context.screen.frame,
+            kind: context.kind
         )
 
-        guard setPointAttribute(kAXPositionAttribute as CFString, value: targetAXOrigin, on: windowElement) else {
-            throw WindowCenteringError.unableToWriteWindowPosition
+        if setPointAttribute(kAXPositionAttribute as CFString, value: targetAXOrigin, on: windowElement) {
+            return
         }
+
+        // If the window is far out-of-bounds, some apps reject "ideal" coordinates.
+        // Try bringing it back into the visible region first, then re-apply centering.
+        let currentRect: CGRect = {
+            switch context.kind {
+            case .bottomLeft:
+                return CGRect(origin: currentPosition, size: windowSize)
+            case .topLeft:
+                let convertedBottomY = context.screen.frame.maxY - currentPosition.y - windowSize.height
+                return CGRect(x: currentPosition.x, y: convertedBottomY, width: windowSize.width, height: windowSize.height)
+            }
+        }()
+
+        let backInVisible = WindowGeometry.constrainedOrigin(origin: currentRect.origin, windowSize: windowSize, bounds: visibleFrame)
+        let backAXOrigin = toAXOrigin(
+            bottomLeftOrigin: backInVisible,
+            windowSize: windowSize,
+            screenFrame: context.screen.frame,
+            kind: context.kind
+        )
+        _ = setPointAttribute(kAXPositionAttribute as CFString, value: backAXOrigin, on: windowElement)
+
+        if setPointAttribute(kAXPositionAttribute as CFString, value: targetAXOrigin, on: windowElement) {
+            return
+        }
+
+        // Last resort: some windows accept AXFrame but not AXPosition.
+        let frameRect = CGRect(origin: targetAXOrigin, size: windowSize)
+        if setRectAttribute("AXFrame" as CFString, value: frameRect, on: windowElement) {
+            return
+        }
+
+        throw WindowCenteringError.unableToWriteWindowPosition
     }
 
     private func focusedWindowElement(for appElement: AXUIElement) -> AXUIElement? {
@@ -201,6 +255,14 @@ final class WindowCenteringService {
         return AXUIElementSetAttributeValue(element, attribute, axValue) == .success
     }
 
+    private func setRectAttribute(_ attribute: CFString, value: CGRect, on element: AXUIElement) -> Bool {
+        var mutableRect = value
+        guard let axValue = AXValueCreate(.cgRect, &mutableRect) else {
+            return false
+        }
+        return AXUIElementSetAttributeValue(element, attribute, axValue) == .success
+    }
+
     private func boolAttribute(_ attribute: CFString, on element: AXUIElement) -> Bool? {
         var value: CFTypeRef?
         guard AXUIElementCopyAttributeValue(element, attribute, &value) == .success else {
@@ -270,74 +332,110 @@ final class WindowCenteringService {
         return posMatch && ratio >= 0.98
     }
 
-    private func detectWindowContext(rawPosition: CGPoint, windowSize: CGSize) -> (screen: NSScreen, mode: CoordinateMode)? {
+    private func detectWindowContext(rawPosition: CGPoint, windowSize: CGSize, pid: pid_t?) -> WindowContext? {
         let screens = NSScreen.screens
         guard !screens.isEmpty else { return nil }
 
-        var best: (screen: NSScreen, mode: CoordinateMode, overlap: CGFloat)?
+        let cachedScreen: NSScreen? = {
+            guard let pid, let id = cachedDisplayByPID[pid] else { return nil }
+            return screens.first(where: { displayID(for: $0) == id })
+        }()
+        let cachedKind: CoordinateKind? = {
+            guard let pid else { return nil }
+            return cachedKindByPID[pid]
+        }()
+
+        var best: ContextCandidate?
 
         for screen in screens {
-            let convertedBottomY = screen.frame.maxY - rawPosition.y - windowSize.height
-            let convertedRect = CGRect(
-                x: rawPosition.x,
-                y: convertedBottomY,
-                width: windowSize.width,
-                height: windowSize.height
-            )
-            let topOverlap = convertedRect.intersection(screen.frame).area
-            updateBest(
-                best: &best,
-                candidate: (screen, .topLeft(screenTop: screen.frame.maxY), topOverlap)
-            )
+            let screenFrame = screen.frame
 
             let bottomRect = CGRect(origin: rawPosition, size: windowSize)
-            let bottomOverlap = bottomRect.intersection(screen.frame).area
-            updateBest(
-                best: &best,
-                candidate: (screen, .bottomLeft, bottomOverlap)
-            )
+            let bottomOverlap = bottomRect.intersection(screenFrame).area
+            let bottomDist2 = distanceSquaredFromRectCenter(bottomRect, to: screenFrame)
+            consider(candidate: ContextCandidate(screen: screen, kind: .bottomLeft, rect: bottomRect, overlap: bottomOverlap, distance2: bottomDist2), best: &best, cachedScreen: cachedScreen, cachedKind: cachedKind)
+
+            let convertedBottomY = screenFrame.maxY - rawPosition.y - windowSize.height
+            let topRect = CGRect(x: rawPosition.x, y: convertedBottomY, width: windowSize.width, height: windowSize.height)
+            let topOverlap = topRect.intersection(screenFrame).area
+            let topDist2 = distanceSquaredFromRectCenter(topRect, to: screenFrame)
+            consider(candidate: ContextCandidate(screen: screen, kind: .topLeft, rect: topRect, overlap: topOverlap, distance2: topDist2), best: &best, cachedScreen: cachedScreen, cachedKind: cachedKind)
         }
 
         if let best {
-            return (best.screen, best.mode)
-        }
-        if let main = NSScreen.main {
-            return (main, .bottomLeft)
+            // If we had any meaningful overlap, treat this as reliable and update cache.
+            if let pid, best.overlap > 1 {
+                if let id = displayID(for: best.screen) {
+                    cachedDisplayByPID[pid] = id
+                }
+                cachedKindByPID[pid] = best.kind
+            } else if cachedScreen != nil, let cachedScreen, let cachedKind {
+                return WindowContext(screen: cachedScreen, kind: cachedKind, overlap: 0)
+            }
+            return WindowContext(screen: best.screen, kind: best.kind, overlap: best.overlap)
         }
         return nil
     }
 
-    private func updateBest(
-        best: inout (screen: NSScreen, mode: CoordinateMode, overlap: CGFloat)?,
-        candidate: (screen: NSScreen, mode: CoordinateMode, overlap: CGFloat)
-    ) {
+    private func consider(candidate: ContextCandidate, best: inout ContextCandidate?, cachedScreen: NSScreen?, cachedKind: CoordinateKind?) {
+        let overlapTol: CGFloat = 0.5
+        let cacheBonus: CGFloat = 0.25
+
+        // Score by overlap first; break ties by distance; preserve the historic tie-break of preferring top-left.
+        func adjustedOverlap(_ c: ContextCandidate) -> CGFloat {
+            if let cachedScreen, let cachedKind,
+               cachedScreen == c.screen, cachedKind == c.kind
+            {
+                return c.overlap + cacheBonus
+            }
+            return c.overlap
+        }
+
         if let currentBest = best {
-            if candidate.overlap > currentBest.overlap {
+            let candOverlap = adjustedOverlap(candidate)
+            let bestOverlap = adjustedOverlap(currentBest)
+
+            if candOverlap > bestOverlap + overlapTol {
                 best = candidate
                 return
             }
 
-            let isTie = abs(candidate.overlap - currentBest.overlap) < 0.5
-            if isTie {
-                switch (currentBest.mode, candidate.mode) {
-                case (.bottomLeft, .topLeft):
+            let diff = candOverlap > bestOverlap ? (candOverlap - bestOverlap) : (bestOverlap - candOverlap)
+            if diff <= overlapTol {
+                if candidate.distance2 + 0.5 < currentBest.distance2 {
                     best = candidate
                     return
-                default:
+                }
+                // If still tied, prefer top-left (original behavior).
+                let distDiff = candidate.distance2 > currentBest.distance2 ? (candidate.distance2 - currentBest.distance2) : (currentBest.distance2 - candidate.distance2)
+                if distDiff <= 0.5 {
+                    if currentBest.kind == .bottomLeft, candidate.kind == .topLeft {
+                        best = candidate
+                        return
+                    }
+                }
+            }
+
+            // If both overlaps are zero, pick the closest screen.
+            if currentBest.overlap <= overlapTol, candidate.overlap <= overlapTol {
+                if candidate.distance2 + 0.5 < currentBest.distance2 {
+                    best = candidate
                     return
                 }
             }
             return
         }
+
         best = candidate
     }
 
-    private func toAXY(bottomLeftY: CGFloat, windowHeight: CGFloat, mode: CoordinateMode) -> CGFloat {
-        switch mode {
+    private func toAXOrigin(bottomLeftOrigin: CGPoint, windowSize: CGSize, screenFrame: CGRect, kind: CoordinateKind) -> CGPoint {
+        switch kind {
         case .bottomLeft:
-            return bottomLeftY
-        case .topLeft(let screenTop):
-            return (screenTop - bottomLeftY - windowHeight).rounded()
+            return CGPoint(x: bottomLeftOrigin.x.rounded(), y: bottomLeftOrigin.y.rounded())
+        case .topLeft:
+            let y = (screenFrame.maxY - bottomLeftOrigin.y - windowSize.height).rounded()
+            return CGPoint(x: bottomLeftOrigin.x.rounded(), y: y)
         }
     }
 
@@ -356,6 +454,24 @@ final class WindowCenteringService {
             width: frame.width - leftInset - rightInset,
             height: frame.height - topInset - bottomInset
         )
+    }
+
+    private func distanceSquaredFromRectCenter(_ rect: CGRect, to bounds: CGRect) -> CGFloat {
+        let cx = rect.midX
+        let cy = rect.midY
+        let nx = clamp(cx, min: bounds.minX, max: bounds.maxX)
+        let ny = clamp(cy, min: bounds.minY, max: bounds.maxY)
+        let dx = cx - nx
+        let dy = cy - ny
+        return dx * dx + dy * dy
+    }
+
+    private func clamp(_ value: CGFloat, min lowerBound: CGFloat, max upperBound: CGFloat) -> CGFloat {
+        Swift.max(lowerBound, Swift.min(value, upperBound))
+    }
+
+    private func displayID(for screen: NSScreen) -> CGDirectDisplayID? {
+        screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID
     }
 }
 
